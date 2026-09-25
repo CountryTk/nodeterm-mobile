@@ -83,3 +83,43 @@ private func event(_ node: String = "node", state: AgentState = .working) -> Age
                                        sessionPhase: .start), onScreen: false)
     #expect(await store.status(for: "node")?.state == .unknown)
 }
+
+@Test func viewingDuringSnapshotDoesNotPreserveStaleStatus() async {
+    let store = AgentStatusStore(clock: { 1_000 })
+    await store.ingest(event(state: .done), onScreen: false)
+    await store.ingest(event("vanished", state: .done), onScreen: false)
+    let revision = await store.beginSnapshot()
+    _ = await store.markViewed(nodeId: "node")
+    _ = await store.markViewed(nodeId: "vanished")
+    await store.replaceSnapshot([event()], since: revision)
+    #expect(await store.status(for: "node")?.state == .working)
+    #expect(await store.status(for: "node")?.unread == false)
+    #expect(await store.status(for: "vanished") == nil)
+}
+
+@Test func unreadClearDuringSnapshotDoesNotPreserveStaleIdentity() async {
+    let store = AgentStatusStore(clock: { 1_000 })
+    await store.ingest(event(state: .blocked), onScreen: false)
+    await store.ingest(event("vanished"), onScreen: false)
+    let revision = await store.beginSnapshot()
+    await store.clearUnread(nodeId: "node")
+    await store.clearUnread(nodeId: "vanished")
+    let current = AgentStatusEvent(nodeId: "node", agentId: "claude", kind: .state, state: .working)
+    await store.replaceSnapshot([current], since: revision)
+    #expect(await store.status(for: "node")?.agentId == "claude")
+    #expect(await store.status(for: "node")?.state == .working)
+    #expect(await store.status(for: "node")?.unread == false)
+    #expect(await store.status(for: "vanished") == nil)
+}
+
+@Test func staleSweepDuringSnapshotCannotOverrideFreshServerEvidence() async {
+    let store = AgentStatusStore(clock: { 1_000 }, staleThresholdMs: 100)
+    await store.ingest(event(), onScreen: false)
+    await store.ingest(event("vanished"), onScreen: false)
+    let revision = await store.beginSnapshot()
+    await store.sweepStaleWorking(now: 2_000)
+    #expect(await store.status(for: "node")?.state == .unknown)
+    await store.replaceSnapshot([event()], since: revision)
+    #expect(await store.status(for: "node")?.state == .working)
+    #expect(await store.status(for: "vanished") == nil)
+}

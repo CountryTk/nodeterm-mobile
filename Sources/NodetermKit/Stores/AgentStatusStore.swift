@@ -38,7 +38,7 @@ public actor AgentStatusStore: AgentStatusReducing {
         let outcome = AgentStatusReducer.reduce(prior, event, onScreen: onScreen, now: clock())
         guard outcome.reduction != prior else { return }
         reductions[event.nodeId] = outcome.reduction
-        noteChange(event.nodeId)
+        noteStatusChange(event.nodeId)
     }
 
     public func beginSnapshot() async -> Int {
@@ -64,7 +64,8 @@ public actor AgentStatusStore: AgentStatusReducing {
         nodeRevisions = nodeRevisions.filter { next[$0.key] != nil }
     }
 
-    private func noteChange(_ nodeId: String) {
+    // Only accepted live status can outrank a snapshot, not read flags or local stale decay.
+    private func noteStatusChange(_ nodeId: String) {
         revision += 1
         nodeRevisions[nodeId] = revision
     }
@@ -79,7 +80,6 @@ public actor AgentStatusStore: AgentStatusReducing {
         guard var r = reductions[nodeId] else { return }
         r.unread = false
         reductions[nodeId] = r
-        noteChange(nodeId)
     }
 
     /// The user viewed the session: clear unread. Returns `true` iff the node is `done` and the
@@ -89,7 +89,6 @@ public actor AgentStatusStore: AgentStatusReducing {
         r.unread = false
         let shouldAck = (r.state == .done)
         reductions[nodeId] = r
-        noteChange(nodeId)
         return shouldAck
     }
 
@@ -112,7 +111,6 @@ public actor AgentStatusStore: AgentStatusReducing {
         for (id, r) in reductions {
             let swept = AgentStatusReducer.sweepStaleWorking(r, now: t, thresholdMs: staleThresholdMs)
             reductions[id] = swept
-            if swept != r { noteChange(id) }
         }
     }
 

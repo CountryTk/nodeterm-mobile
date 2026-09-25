@@ -57,6 +57,22 @@ public func runStoresReducerTests() {
     testProviderIdentityIsRetained()
     testProviderIdentityGuards()
     testCodexStateSessionStartBoundary()
+    testPeerSessionReplacement()
+}
+
+private func testPeerSessionReplacement() {
+    var current = NodeReduction(nodeId: "n1", agentId: "claude", state: .working)
+    // Mirror writes may coalesce the old idle edge and the new start, leaving only the new ask.
+    for event in [
+        ev(agentId: "claude", kind: .session, sessionPhase: .end, sessionId: "old"),
+        ev(agentId: "codex", kind: .session, sessionPhase: .start, sessionId: "new"),
+        ev(agentId: "codex", state: .blocked, pendingId: "new-ticket", askKind: .approval, sessionId: "new")
+    ] {
+        current = AgentStatusReducer.reduce(current, event, onScreen: false, now: 10).reduction
+    }
+    checkEq(current.agentId, "codex", "peer replacement changes provider before attach")
+    checkEq(current.state, .blocked, "coalesced approval remains visible")
+    checkEq(current.pendingId, "new-ticket", "coalesced approval retains its ticket")
 }
 
 private func testProviderIdentityIsRetained() {
