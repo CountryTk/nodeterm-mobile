@@ -1,0 +1,85 @@
+import Testing
+@testable import NodetermKit
+
+private func event(_ node: String = "node", state: AgentState = .working) -> AgentStatusEvent {
+    AgentStatusEvent(nodeId: node, agentId: "codex", kind: .state, state: state)
+}
+
+@Test func snapshotHydratesWithoutOpeningTerminal() async {
+    let store = AgentStatusStore(clock: { 1_000 })
+    let revision = await store.beginSnapshot()
+    await store.replaceSnapshot([event()], since: revision)
+    let status = await store.status(for: "node")
+    #expect(status?.state == .working)
+    #expect(status?.agentId == "codex")
+    #expect(status?.unread == false)
+}
+
+@Test func reconnectSnapshotRemovesVanishedNodesAndOldHoldoff() async {
+    let store = AgentStatusStore(clock: { 1_000 })
+    await store.ingest(event(state: .done), onScreen: false)
+    await store.ingest(event("vanished"), onScreen: false)
+    let revision = await store.beginSnapshot()
+    await store.replaceSnapshot([event()], since: revision)
+    #expect(await store.status(for: "node")?.state == .working)
+    #expect(await store.status(for: "vanished") == nil)
+}
+
+@Test func snapshotCannotOverwriteOrPruneNewerLiveEvents() async {
+    let store = AgentStatusStore(clock: { 1_000 })
+    let revision = await store.beginSnapshot()
+    await store.ingest(event(state: .blocked), onScreen: false)
+    await store.ingest(event("new-node"), onScreen: false)
+    await store.replaceSnapshot([event()], since: revision)
+    #expect(await store.status(for: "node")?.state == .blocked)
+    #expect(await store.status(for: "new-node")?.state == .working)
+}
+
+@Test func obsoleteSnapshotCannotReplaceNewConnectionState() async {
+    let store = AgentStatusStore(clock: { 1_000 })
+    let older = await store.beginSnapshot()
+    let newer = await store.beginSnapshot()
+    await store.replaceSnapshot([event(state: .blocked)], since: newer)
+    await store.replaceSnapshot([event()], since: older)
+    #expect(await store.status(for: "node")?.state == .blocked)
+}
+
+@Test func ignoredEventsCannotBlockCurrentSnapshot() async {
+    let store = AgentStatusStore(clock: { 1_000 })
+    await store.ingest(event(state: .done), onScreen: false)
+    let revision = await store.beginSnapshot()
+    await store.ingest(AgentStatusEvent(nodeId: "node", agentId: "claude", kind: .state,
+                                       state: .blocked), onScreen: false)
+    await store.ingest(event(), onScreen: false) // rejected by the old DONE holdoff
+    await store.ingest(AgentStatusEvent(nodeId: "fresh", agentId: "codex", kind: .state,
+                                       state: .unknown("future-state")), onScreen: false)
+    await store.replaceSnapshot([event(), event("fresh")], since: revision)
+    #expect(await store.status(for: "node")?.state == .working)
+    #expect(await store.status(for: "fresh")?.state == .working)
+}
+
+@Test func snapshotPreservesApprovalsWithoutInventingUnread() async {
+    let store = AgentStatusStore(clock: { 1_000 })
+    await store.ingest(event(), onScreen: false)
+    let revision = await store.beginSnapshot()
+    var approval = event(state: .blocked)
+    approval.pendingId = "pending-1"
+    approval.askKind = .approval
+    await store.replaceSnapshot([approval], since: revision)
+    let status = await store.status(for: "node")
+    #expect(status?.pendingId == "pending-1")
+    #expect(status?.askKind == .approval)
+    #expect(status?.badge == .needsYou)
+    #expect(status?.unread == false)
+}
+
+@Test func emptySnapshotReallyClearsReducerNotOnlyVisibleRows() async {
+    let store = AgentStatusStore(clock: { 1_000 })
+    await store.ingest(event(state: .blocked), onScreen: false)
+    let revision = await store.beginSnapshot()
+    await store.replaceSnapshot([], since: revision)
+    #expect(await store.all().isEmpty)
+    await store.ingest(AgentStatusEvent(nodeId: "node", agentId: "codex", kind: .session,
+                                       sessionPhase: .start), onScreen: false)
+    #expect(await store.status(for: "node")?.state == .unknown)
+}

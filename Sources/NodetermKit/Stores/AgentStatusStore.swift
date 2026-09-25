@@ -10,6 +10,9 @@ import Foundation
 /// `Date()` inline — so the DONE-HOLDOFF (SPEC §6.3 rule 5) is testable.
 public actor AgentStatusStore: AgentStatusReducing {
     private var reductions: [String: NodeReduction] = [:]
+    private var revision = 0
+    private var nodeRevisions: [String: Int] = [:]
+    private var snapshotRevision: Int?
     /// `context:update` is keyed by sessionId, not nodeId, and can arrive before or after the node
     /// is known — hold it here and merge at read time (SPEC §6.1).
     private var contextBySession: [String: ContextWindowUsage] = [:]
@@ -33,7 +36,37 @@ public actor AgentStatusStore: AgentStatusReducing {
     public func ingest(_ event: AgentStatusEvent, onScreen: Bool) async {
         let prior = reductions[event.nodeId] ?? NodeReduction(nodeId: event.nodeId)
         let outcome = AgentStatusReducer.reduce(prior, event, onScreen: onScreen, now: clock())
+        guard outcome.reduction != prior else { return }
         reductions[event.nodeId] = outcome.reduction
+        noteChange(event.nodeId)
+    }
+
+    public func beginSnapshot() async -> Int {
+        revision += 1
+        snapshotRevision = revision
+        return revision
+    }
+
+    public func replaceSnapshot(_ events: [AgentStatusEvent], since version: Int) async {
+        guard snapshotRevision == version else { return }
+        snapshotRevision = nil
+        let newerNodes = Set(nodeRevisions.filter { $0.value > version }.map(\.key))
+        var next = reductions.filter { newerNodes.contains($0.key) }
+        for event in events where !newerNodes.contains(event.nodeId) {
+            // A snapshot is current state, not a new transition: do not apply old DONE holdoff
+            // or manufacture unread completion alerts for work that finished while disconnected.
+            let prior = NodeReduction(nodeId: event.nodeId,
+                                      unread: reductions[event.nodeId]?.unread ?? false)
+            next[event.nodeId] = AgentStatusReducer.reduce(prior, event, onScreen: true,
+                                                          now: clock()).reduction
+        }
+        reductions = next
+        nodeRevisions = nodeRevisions.filter { next[$0.key] != nil }
+    }
+
+    private func noteChange(_ nodeId: String) {
+        revision += 1
+        nodeRevisions[nodeId] = revision
     }
 
     /// Fold a `context:update` payload into the meter, keyed by sessionId (SPEC §6.1/§11.6).
@@ -46,6 +79,7 @@ public actor AgentStatusStore: AgentStatusReducing {
         guard var r = reductions[nodeId] else { return }
         r.unread = false
         reductions[nodeId] = r
+        noteChange(nodeId)
     }
 
     /// The user viewed the session: clear unread. Returns `true` iff the node is `done` and the
@@ -55,6 +89,7 @@ public actor AgentStatusStore: AgentStatusReducing {
         r.unread = false
         let shouldAck = (r.state == .done)
         reductions[nodeId] = r
+        noteChange(nodeId)
         return shouldAck
     }
 
@@ -75,7 +110,9 @@ public actor AgentStatusStore: AgentStatusReducing {
     public func sweepStaleWorking(now: Int? = nil) async {
         let t = now ?? clock()
         for (id, r) in reductions {
-            reductions[id] = AgentStatusReducer.sweepStaleWorking(r, now: t, thresholdMs: staleThresholdMs)
+            let swept = AgentStatusReducer.sweepStaleWorking(r, now: t, thresholdMs: staleThresholdMs)
+            reductions[id] = swept
+            if swept != r { noteChange(id) }
         }
     }
 
@@ -121,6 +158,7 @@ public actor AgentStatusStore: AgentStatusReducing {
         if let sid = r.sessionId { ctx = contextBySession[sid] }
         return AgentNodeStatus(
             nodeId: r.nodeId,
+            agentId: r.agentId,
             state: r.state,
             unread: r.unread,
             sessionId: r.sessionId,
