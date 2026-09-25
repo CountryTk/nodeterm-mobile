@@ -96,6 +96,11 @@ public enum AgentStatusReducer {
     /// is supplied by the caller. Unknown event kinds are a no-op (no crash, no state change).
     public static func reduce(_ prior: NodeReduction, _ event: AgentStatusEvent,
                               onScreen: Bool, now: Int) -> ReduceOutcome {
+        // Codex keeps its initial working state but now marks the session boundary explicitly.
+        // Ordinary foreign working events must still be rejected as possible child activity.
+        if event.kind == .state, event.state == .working, event.sessionPhase == .start {
+            return reduceSession(prior, event, now: now)
+        }
         switch event.kind {
         case .session:
             return reduceSession(prior, event, now: now)
@@ -123,7 +128,7 @@ public enum AgentStatusReducer {
             if let sid = event.sessionId, !sid.isEmpty { s.sessionId = sid }
             // SPEC §6.3 rule 6: start → reset to idle/unknown; end → reset AND clear recurring/
             // fan-out UI. Both drop any held prompt, the latch, the done clock, and unread.
-            s.state = .unknown
+            s.state = event.kind == .state && event.state == .working ? .working : .unknown
             s.unread = false
             s.pendingId = nil
             s.askKind = nil

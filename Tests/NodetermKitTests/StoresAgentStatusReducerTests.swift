@@ -56,6 +56,7 @@ public func runStoresReducerTests() {
     testSweepStaleWorking()
     testProviderIdentityIsRetained()
     testProviderIdentityGuards()
+    testCodexStateSessionStartBoundary()
 }
 
 private func testProviderIdentityIsRetained() {
@@ -109,6 +110,39 @@ private func testProviderIdentityGuards() {
         relaunched, ev(agentId: "codex", kind: .session, sessionPhase: .start), onScreen: false, now: 6
     )
     checkEq(switched.reduction.agentId, "codex", "legitimate session start may switch provider")
+}
+
+private func testCodexStateSessionStartBoundary() {
+    let idle = NodeReduction(nodeId: "n1", agentId: "claude", state: .done)
+    let relaunch = AgentStatusReducer.reduce(
+        idle,
+        ev(agentId: "codex", kind: .state, state: .working, sessionPhase: .start, sessionId: "cx-1"),
+        onScreen: false,
+        now: 10
+    )
+    checkEq(relaunch.reduction.agentId, "codex", "marked Codex SessionStart may switch an idle provider")
+    checkEq(relaunch.reduction.sessionId, "cx-1", "marked Codex SessionStart records its session")
+    checkEq(relaunch.reduction.state, .working,
+            "marked Codex SessionStart preserves Codex's initial working state")
+
+    let foreignWorking = AgentStatusReducer.reduce(
+        idle,
+        ev(agentId: "codex", kind: .state, state: .working, sessionId: "cx-child"),
+        onScreen: false,
+        now: 11
+    )
+    checkEq(foreignWorking.reduction, idle,
+            "unmarked foreign working state remains protected as a possible child event")
+
+    let active = NodeReduction(nodeId: "n1", agentId: "claude", state: .working)
+    let leakedStart = AgentStatusReducer.reduce(
+        active,
+        ev(agentId: "codex", kind: .state, state: .working, sessionPhase: .start, sessionId: "cx-child"),
+        onScreen: false,
+        now: 12
+    )
+    checkEq(leakedStart.reduction, active,
+            "marked foreign SessionStart cannot reset an active provider")
 }
 
 // MARK: - Rule 1 base adoption + Rule 8 unread edges (table-driven)
