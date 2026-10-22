@@ -47,7 +47,7 @@ public actor RpcClient: RpcClienting {
     private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
 
     private var evSubs: [String: [UUID: AsyncStream<[JSONValue]>.Continuation]] = [:]
-    private var ptySubs: [String: [UUID: AsyncStream<Data>.Continuation]] = [:]
+    private var ptySubs: [String: [UUID: PtyOutputBuffer]] = [:]
     private var stateSubs: [UUID: AsyncStream<ConnectionState>.Continuation] = [:]
 
     /// Global early-event buffer, insertion-ordered, drop-oldest at 4096 (SPEC §4.9).
@@ -99,7 +99,7 @@ public actor RpcClient: RpcClienting {
         // terminal VM's rejoin loop — must still hear the `.connected` after a background stop →
         // foreground start cycle. Finishing them here was the frozen-after-background bug: the
         // observer's for-await ended silently and the re-attach never fired.
-        finishDataStreams()
+        await finishDataStreams()
     }
 
     // MARK: RpcClienting — request / cast
@@ -217,20 +217,13 @@ public actor RpcClient: RpcClienting {
 
     public func ptyData(for sessionId: String) async -> AsyncStream<Data> {
         let id = UUID()
-        // Bounded (consort finding): a flooding pane must not balloon client memory. Newest wins
-        // — losing intermediate paints costs a redraw, never correctness (tmux repaints).
-        let (stream, cont) = AsyncStream.makeStream(of: Data.self,
-                                                    bufferingPolicy: .bufferingNewest(2048))
         let firstForSession = (ptySubs[sessionId]?.isEmpty ?? true)
-        ptySubs[sessionId, default: [:]][id] = cont
-        cont.onTermination = { [weak self] _ in
-            Task { [weak self] in await self?.dropPtySub(sessionId: sessionId, id: id) }
-        }
-        if firstForSession, let buffered = earlyPty[sessionId] {
-            for payload in buffered { cont.yield(payload) }
-            earlyPty[sessionId] = nil
-        }
-        return stream
+        let initial = firstForSession ? earlyPty.removeValue(forKey: sessionId) ?? [] : []
+        let buffer = PtyOutputBuffer(initial: initial)
+        ptySubs[sessionId, default: [:]][id] = buffer
+        return AsyncStream(unfolding: { await buffer.next() }, onCancel: { [weak self] in
+            Task { await self?.dropPtySub(sessionId: sessionId, id: id) }
+        })
     }
 
     public func connectionStates() async -> AsyncStream<ConnectionState> {
@@ -250,9 +243,10 @@ public actor RpcClient: RpcClienting {
         evSubs[channel]?[id] = nil
         if evSubs[channel]?.isEmpty == true { evSubs[channel] = nil }
     }
-    private func dropPtySub(sessionId: String, id: UUID) {
-        ptySubs[sessionId]?[id] = nil
+    private func dropPtySub(sessionId: String, id: UUID) async {
+        let buffer = ptySubs[sessionId]?.removeValue(forKey: id)
         if ptySubs[sessionId]?.isEmpty == true { ptySubs[sessionId] = nil }
+        await buffer?.finish()
     }
     private func dropStateSub(id: UUID) { stateSubs[id] = nil }
 
@@ -287,10 +281,14 @@ public actor RpcClient: RpcClienting {
             // canceller) already closed and rejected everything for THIS run. Just leave.
             if Task.isCancelled { return }
             transport = nil
+            // Never carry old VT bytes across the reset/seed paint of a reattach. Event and
+            // connection subscriptions remain live; the terminal recreates only its data stream.
+            await finishPtyStreams()
             // Same leak rule after a mid-life drop: the dead socket's URLSession/ping task are
             // only released by close(). stop() already closed the CURRENT transport, but by then
             // this local `t` has been detached from `transport` — close it here, idempotently.
             await t.close()
+            if Task.isCancelled { return }
             // Clear the pending map BEFORE rejecting so a re-request cannot collide with a stale id
             // (SPEC §4.8.1).
             failAllPending()
@@ -309,7 +307,11 @@ public actor RpcClient: RpcClienting {
             } catch {
                 return  // socket closed/errored → back to the reconnect loop
             }
-            handle(msg)
+            guard !stopped, !Task.isCancelled else { return }
+            // A local renderer overflow is a real loss of synchronization even when the socket
+            // drains quickly. Use the existing reconnect/reattach protocol to get a fresh seed;
+            // never destroy the pane or pause another viewer's terminal with pty:flow.
+            if !(await handle(msg)) { return }
         }
     }
 
@@ -325,11 +327,11 @@ public actor RpcClient: RpcClienting {
 
     // MARK: Inbound dispatch (SPEC §4.3 / §4.4 / §4.5)
 
-    private func handle(_ msg: WSMessage) {
+    private func handle(_ msg: WSMessage) async -> Bool {
         switch msg {
         case .text(let s):
             // One bad frame must never crash the connection — parse returns nil ⇒ drop (§4.3).
-            guard let frame = RpcFrame.parse(text: s) else { return }
+            guard let frame = RpcFrame.parse(text: s) else { return true }
             switch frame {
             case .resOk(let id, let result):
                 // A `res` whose id matches no in-flight request is dropped (§4.3).
@@ -340,13 +342,14 @@ public actor RpcClient: RpcClienting {
             case .ev(let channel, let args, let undef):
                 dispatchEvent(channel: channel, args: applyInboundUndef(args, undef))  // §4.4 decode
             case .req, .cast:
-                return  // the server never sends these; ignore (§4.3)
+                return true  // the server never sends these; ignore (§4.3)
             }
         case .binary(let data):
             // Binary is pty output only; a bad layout drops (§4.5).
-            guard let (sid, payload) = PtyBinaryFrame.decode(data) else { return }
-            dispatchPty(sessionId: sid, payload: payload)
+            guard let (sid, payload) = PtyBinaryFrame.decode(data) else { return true }
+            return await dispatchPty(sessionId: sid, payload: payload)
         }
+        return true
     }
 
     /// Apply the inbound `undef` decode (SPEC §4.4): marked indexes are logically absent. Junk /
@@ -374,24 +377,23 @@ public actor RpcClient: RpcClienting {
         }
     }
 
-    private func dispatchPty(sessionId: String, payload: Data) {
+    private func dispatchPty(sessionId: String, payload: Data) async -> Bool {
+        guard !payload.isEmpty else { return true }
         if let subs = ptySubs[sessionId], !subs.isEmpty {
-            for (_, cont) in subs { cont.yield(payload) }
-            return
+            for buffer in subs.values {
+                if !(await buffer.append(payload)) { return false }
+            }
+            return true
         }
         var buf = earlyPty[sessionId] ?? []
         buf.append(payload)
-        // Count AND byte caps (consort finding): the count cap alone let a few near-8MiB frames
-        // stack per session before any subscriber existed. Oldest dropped — a late subscriber
-        // repaints from the create-result screen anyway.
-        if buf.count > NodetermWire.earlyEventBufferCap {
-            buf.removeFirst(buf.count - NodetermWire.earlyEventBufferCap)
-        }
-        var bytes = buf.reduce(0) { $0 + $1.count }
-        while bytes > 4 * 1024 * 1024, !buf.isEmpty {
-            bytes -= buf.removeFirst().count
-        }
+        // The create-result seed precedes these bytes, so losing them here is just as unsafe
+        // as losing subscribed output. Reattach on overflow instead of silently trimming VT.
+        let bytes = buf.reduce(0) { $0 + $1.count }
+        guard buf.count <= PtyOutputBuffer.chunkLimit,
+              buf.count == 1 || bytes <= PtyOutputBuffer.byteLimit else { return false }
         earlyPty[sessionId] = buf
+        return true
     }
 
     // MARK: State + teardown helpers
@@ -411,12 +413,19 @@ public actor RpcClient: RpcClienting {
         for (_, cont) in conts { cont.resume(throwing: RpcError.disconnected) }
     }
 
-    private func finishDataStreams() {
+    private func finishPtyStreams() async {
+        let buffers = ptySubs.values.flatMap { $0.values }
+        ptySubs.removeAll()
+        earlyPty.removeAll()
+        for buffer in buffers { await buffer.finish() }
+    }
+
+    private func finishDataStreams() async {
         for (_, subs) in evSubs { for (_, c) in subs { c.finish() } }
-        for (_, subs) in ptySubs { for (_, c) in subs { c.finish() } }
         // stateSubs deliberately NOT touched — those streams outlive the run (see stop()).
-        evSubs.removeAll(); ptySubs.removeAll()
-        earlyEvents.removeAll(); earlyPty.removeAll()
+        evSubs.removeAll()
+        earlyEvents.removeAll()
+        await finishPtyStreams()
     }
 }
 

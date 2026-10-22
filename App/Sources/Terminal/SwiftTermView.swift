@@ -51,6 +51,8 @@ public final class TerminalHandle {
         guard let t = view?.getTerminal() else { return nil }
         return (t.cols, t.rows)
     }
+
+    public func cancelScrolling() { (view as? ScrollableTerminalView)?.cancelScrolling() }
 }
 
 /// `UIViewRepresentable` wrapping SwiftTerm's `TerminalView` (SPEC §8.3). Feeds `pty:data` verbatim,
@@ -92,6 +94,10 @@ public struct SwiftTermView: UIViewRepresentable {
         // covers the phone use case — showing both stacked two toolbars over the keyboard.
         view.inputAccessoryView = nil
         view.terminalDelegate = context.coordinator
+        view.batchInput = { [weak coordinator = context.coordinator] body in
+            guard let coordinator else { body(); return }
+            coordinator.batchInput(body)
+        }
         view.font = UIFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
         applyTheme(to: view)
         handle.view = view
@@ -122,7 +128,19 @@ public struct SwiftTermView: UIViewRepresentable {
 
     public final class Coordinator: NSObject, TerminalViewDelegate {
         var parent: SwiftTermView
+        private var batching = false
+        private var inputBatch = Data()
         init(_ parent: SwiftTermView) { self.parent = parent }
+
+        func batchInput(_ body: () -> Void) {
+            batching = true
+            body()
+            batching = false
+            guard !inputBatch.isEmpty else { return }
+            let data = inputBatch
+            inputBatch = Data()
+            parent.onInput(data)
+        }
 
         // User keystrokes → pty:write, applying the Ctrl latch (SPEC §9.3).
         public func send(source: TerminalView, data: ArraySlice<UInt8>) {
@@ -134,7 +152,8 @@ public struct SwiftTermView: UIViewRepresentable {
                 }
                 parent.clearCtrlLatch()
             }
-            parent.onInput(Data(bytes))
+            if batching { inputBatch.append(contentsOf: bytes) }
+            else { parent.onInput(Data(bytes)) }
         }
 
         // SwiftTerm hands us already-decoded OSC 52 WRITE content; a read query is never delivered
