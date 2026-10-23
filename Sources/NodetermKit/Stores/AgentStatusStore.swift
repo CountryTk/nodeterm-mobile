@@ -58,7 +58,8 @@ public actor AgentStatusStore: AgentStatusReducing {
             // Unread survives only within the same session: a relaunch while disconnected is a
             // session boundary, which live processing would have cleared.
             let old = reductions[event.nodeId]
-            let sameSession = old?.sessionId != nil && old?.sessionId == event.sessionId
+            // Both sides without a session id cannot prove a boundary: keep the bit.
+            let sameSession = old != nil && old?.sessionId == event.sessionId
             let prior = NodeReduction(nodeId: event.nodeId,
                                       unread: sameSession ? (old?.unread ?? false) : false)
             var folded = AgentStatusReducer.reduce(prior, event, onScreen: true, now: clock()).reduction
