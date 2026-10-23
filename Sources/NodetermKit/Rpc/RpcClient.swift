@@ -295,6 +295,8 @@ public actor RpcClient: RpcClienting {
             // Close BEFORE any further suspension: a stop() landing in that window sees
             // `transport == nil` and would otherwise return with this socket still open.
             await t.close()
+            // close() suspends: a stop()+start() in that window owns the subscriptions now.
+            if Task.isCancelled { return }
             // Never carry old VT bytes across the reset/seed paint of a reattach. Event and
             // connection subscriptions remain live; the terminal recreates only its data stream.
             await finishPtyStreams()
