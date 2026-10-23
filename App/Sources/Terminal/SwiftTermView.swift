@@ -145,7 +145,9 @@ public struct SwiftTermView: UIViewRepresentable {
         // User keystrokes → pty:write, applying the Ctrl latch (SPEC §9.3).
         public func send(source: TerminalView, data: ArraySlice<UInt8>) {
             var bytes = [UInt8](data)
-            if parent.ctrlLatched() {
+            // A batched wheel report is not a keystroke: it must not consume a latched Ctrl that
+            // the user set while momentum scrolling was still decelerating.
+            if !batching, parent.ctrlLatched() {
                 // Transform the first printable byte to its control code (c & 0x1f), then clear.
                 if let first = bytes.first, (0x40...0x7f).contains(first) {
                     bytes[0] = first & 0x1f

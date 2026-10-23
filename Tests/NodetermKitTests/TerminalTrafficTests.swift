@@ -43,6 +43,37 @@ import Testing
     await buffer.finish()
 }
 
+@Test func subscriptionReleaseFiresOnceOnExplicitFireOrDeinit() {
+    final class Count: @unchecked Sendable { var n = 0 }
+    let fired = Count(), dropped = Count()
+    var token: PtySubscriptionRelease? = PtySubscriptionRelease { fired.n += 1 }
+    token?.fire()
+    token = nil
+    #expect(fired.n == 1)
+    var other: PtySubscriptionRelease? = PtySubscriptionRelease { dropped.n += 1 }
+    _ = other
+    other = nil
+    #expect(dropped.n == 1)
+}
+
+/// The leak the release token exists for: a consumer that `break`s out of `for await` after a
+/// delivered batch never cancels a pending pull, so `onCancel` alone would never deregister it.
+@Test func breakingOutOfAnOutputStreamStillReleasesTheSubscription() async {
+    final class Count: @unchecked Sendable { var n = 0 }
+    let released = Count()
+    let buffer = PtyOutputBuffer(initial: [Data("a".utf8), Data("b".utf8)])
+    do {
+        let release = PtySubscriptionRelease { released.n += 1 }
+        let stream = AsyncStream(unfolding: {
+            withExtendedLifetime(release) {}
+            return await buffer.next()
+        }, onCancel: { release.fire() })
+        for await _ in stream { break }
+    }
+    #expect(released.n == 1)
+    await buffer.finish()
+}
+
 @Test func scrollPreservesFastDragDistanceAcrossFrameBatches() {
     var scroll = TerminalScrollMotion()
     scroll.drag(points: 500)

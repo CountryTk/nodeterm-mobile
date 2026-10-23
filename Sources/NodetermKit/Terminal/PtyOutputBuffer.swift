@@ -80,3 +80,22 @@ actor PtyOutputBuffer {
         return result
     }
 }
+
+/// Runs `action` once: on an explicit `fire()` (task cancellation) or when the last reference to
+/// the token goes away (the subscriber's stream was dropped without cancelling a pending pull).
+final class PtySubscriptionRelease: @unchecked Sendable {
+    private let lock = NSLock()
+    private var action: (@Sendable () -> Void)?
+
+    init(_ action: @escaping @Sendable () -> Void) { self.action = action }
+
+    func fire() {
+        lock.lock()
+        let pending = action
+        action = nil
+        lock.unlock()
+        pending?()
+    }
+
+    deinit { fire() }
+}

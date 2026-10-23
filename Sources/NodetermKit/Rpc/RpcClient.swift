@@ -221,9 +221,17 @@ public actor RpcClient: RpcClienting {
         let initial = firstForSession ? earlyPty.removeValue(forKey: sessionId) ?? [] : []
         let buffer = PtyOutputBuffer(initial: initial)
         ptySubs[sessionId, default: [:]][id] = buffer
-        return AsyncStream(unfolding: { await buffer.next() }, onCancel: { [weak self] in
+        // `onCancel` fires only when a pending `next()` is cancelled. A consumer that `break`s out
+        // of its loop (or drops the stream) never reaches it, so the unfolding closure also owns a
+        // release token: deallocating the stream deregisters the buffer. An orphaned buffer would
+        // fill on the next viewer's output and reset the shared connection.
+        let release = PtySubscriptionRelease { [weak self] in
             Task { await self?.dropPtySub(sessionId: sessionId, id: id) }
-        })
+        }
+        return AsyncStream(unfolding: {
+            withExtendedLifetime(release) {}
+            return await buffer.next()
+        }, onCancel: { release.fire() })
     }
 
     public func connectionStates() async -> AsyncStream<ConnectionState> {
@@ -281,13 +289,15 @@ public actor RpcClient: RpcClienting {
             // canceller) already closed and rejected everything for THIS run. Just leave.
             if Task.isCancelled { return }
             transport = nil
-            // Never carry old VT bytes across the reset/seed paint of a reattach. Event and
-            // connection subscriptions remain live; the terminal recreates only its data stream.
-            await finishPtyStreams()
             // Same leak rule after a mid-life drop: the dead socket's URLSession/ping task are
             // only released by close(). stop() already closed the CURRENT transport, but by then
             // this local `t` has been detached from `transport` — close it here, idempotently.
+            // Close BEFORE any further suspension: a stop() landing in that window sees
+            // `transport == nil` and would otherwise return with this socket still open.
             await t.close()
+            // Never carry old VT bytes across the reset/seed paint of a reattach. Event and
+            // connection subscriptions remain live; the terminal recreates only its data stream.
+            await finishPtyStreams()
             if Task.isCancelled { return }
             // Clear the pending map BEFORE rejecting so a re-request cannot collide with a stale id
             // (SPEC §4.8.1).
