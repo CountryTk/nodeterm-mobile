@@ -123,3 +123,42 @@ private func event(_ node: String = "node", state: AgentState = .working) -> Age
     #expect(await store.status(for: "node")?.state == .working)
     #expect(await store.status(for: "vanished") == nil)
 }
+
+@Test func snapshotDoneDoesNotArmTheHoldoffAgainstALiveWorking() async {
+    let store = AgentStatusStore(clock: { 1_000 })
+    let revision = await store.beginSnapshot()
+    await store.replaceSnapshot([event(state: .done)], since: revision)
+    #expect(await store.status(for: "node")?.state == .done)
+    // A live `working` without newTurn, inside the 3 s window of hydration: genuine, not a straggler.
+    await store.ingest(event(state: .working), onScreen: false)
+    #expect(await store.status(for: "node")?.state == .working)
+}
+
+@Test func snapshotDropsUnreadAcrossASessionBoundary() async {
+    let store = AgentStatusStore(clock: { 1_000 })
+    var working = event(); working.sessionId = "old"
+    var done = event(state: .done); done.sessionId = "old"
+    await store.ingest(working, onScreen: false)
+    await store.ingest(done, onScreen: false)
+    #expect(await store.status(for: "node")?.unread == true)
+
+    var same = event(state: .done); same.sessionId = "old"
+    var revision = await store.beginSnapshot()
+    await store.replaceSnapshot([same], since: revision)
+    #expect(await store.status(for: "node")?.unread == true)
+
+    var relaunched = event(); relaunched.sessionId = "new"
+    revision = await store.beginSnapshot()
+    await store.replaceSnapshot([relaunched], since: revision)
+    #expect(await store.status(for: "node")?.unread == false)
+}
+
+@Test func stateLessAwaitingInputAdoptsProviderIdentity() async {
+    let store = AgentStatusStore(clock: { 1_000 })
+    var ask = AgentStatusEvent(nodeId: "node", agentId: "claude", kind: .state, state: nil)
+    ask.awaitingInput = true
+    await store.ingest(ask, onScreen: false)
+    let status = await store.status(for: "node")
+    #expect(status?.state == .waiting)
+    #expect(status?.agentId == "claude")
+}

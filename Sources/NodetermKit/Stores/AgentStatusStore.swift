@@ -55,10 +55,17 @@ public actor AgentStatusStore: AgentStatusReducing {
         for event in events where !newerNodes.contains(event.nodeId) {
             // A snapshot is current state, not a new transition: do not apply old DONE holdoff
             // or manufacture unread completion alerts for work that finished while disconnected.
+            // Unread survives only within the same session: a relaunch while disconnected is a
+            // session boundary, which live processing would have cleared.
+            let old = reductions[event.nodeId]
+            let sameSession = old?.sessionId != nil && old?.sessionId == event.sessionId
             let prior = NodeReduction(nodeId: event.nodeId,
-                                      unread: reductions[event.nodeId]?.unread ?? false)
-            next[event.nodeId] = AgentStatusReducer.reduce(prior, event, onScreen: true,
-                                                          now: clock()).reduction
+                                      unread: sameSession ? (old?.unread ?? false) : false)
+            var folded = AgentStatusReducer.reduce(prior, event, onScreen: true, now: clock()).reduction
+            // The node entered DONE at some unknown earlier time, not now. Stamping the hydration
+            // time would arm the 3 s DONE-HOLDOFF and drop a genuine live `working` after connect.
+            folded.doneEnteredAt = nil
+            next[event.nodeId] = folded
         }
         reductions = next
         nodeRevisions = nodeRevisions.filter { next[$0.key] != nil }

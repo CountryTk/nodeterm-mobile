@@ -190,7 +190,11 @@ public enum AgentStatusReducer {
         }
 
         var s = prior
-        if mapped != nil, !event.agentId.isEmpty { s.agentId = event.agentId }
+        // Identity is adopted by any event that drives a transition, including the state-less
+        // forms (an `awaitingInput` latch, an idle rescue of a working node).
+        let transitions = mapped != nil || event.awaitingInput == true
+            || (event.idle == true && prior.state == .working)
+        if transitions, !event.agentId.isEmpty { s.agentId = event.agentId }
         if let sid = event.sessionId, !sid.isEmpty { s.sessionId = sid }
         let fanCleared = (event.newTurn == true) // SPEC §6.3 rule 7
 

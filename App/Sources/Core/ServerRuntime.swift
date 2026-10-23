@@ -128,11 +128,13 @@ public final class ServerRuntime: ObservableObject, Identifiable {
     /// client-local and survive a socket drop; §4.8's "re-subscribe" is about the wire).
     private func onConnected() async {
         await rpc.cast("presence:hello", PresenceHello.args(deviceName: deviceName))
-        await reloadWorkspace()
         // Live status events may have been emitted before this socket connected (notably the
         // desktop-peer mirror's initial sweep). Hydrate from the server after every connect so
-        // Home can show running/needs-you state without opening a PTY first.
-        await reloadStatuses()
+        // Home can show running/needs-you state without opening a PTY first. Started before the
+        // workspace load so its revision watermark precedes any live event, and run alongside it
+        // so a slow snapshot never delays spawn recovery below.
+        async let statuses: Void = reloadStatuses()
+        await reloadWorkspace()
         // SPEC §7.11: a spawn whose launch line or registration was cut off by a socket drop is
         // resumed here, on the runtime, whether or not its terminal view still exists. Runs until
         // the record is settled; `.unknown` (and an undelivered launch) re-run. Settled records are
@@ -140,6 +142,7 @@ public final class ServerRuntime: ObservableObject, Identifiable {
         for (nodeId, record) in spawns where record.needsDrive {
             Task { await self.driveSpawn(nodeId: nodeId) }
         }
+        await statuses
     }
 
     /// Adopt the server's current status snapshot. This is deliberately separate from PTY
