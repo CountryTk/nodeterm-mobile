@@ -146,6 +146,7 @@ public final class TerminalSessionVM: ObservableObject {
 
     /// Called on view disappear: kill ONLY this viewer (SPEC §7.4).
     public func onDisappear() {
+        handle.cancelScrolling()
         if runtime.onScreenNodeId == row.nodeId { runtime.onScreenNodeId = nil }
         tornDown = true
         attached = false
@@ -187,6 +188,7 @@ public final class TerminalSessionVM: ObservableObject {
 
     /// App → background OR view off-screen kept warm (SPEC §7.3): PARK, do not kill.
     public func park() {
+        handle.cancelScrolling()
         guard !sessionId.isEmpty else { return }
         let sid = sessionId, vid = viewerId
         enqueueOutbound { [control] in await control.park(sessionId: sid, viewerId: vid) }
@@ -383,6 +385,9 @@ public final class TerminalSessionVM: ObservableObject {
                 if Task.isCancelled { break }
                 await handle.apply([.feedRaw(data)])
                 if tracksLaunch { await self?.noteLaunchActivity() }
+                // Each batch is at most 64 KiB. Give touch/keyboard work a scheduling point
+                // between parser batches; no fixed sleep is added to an ordinary echoed key.
+                await Task.yield()
             }
         })
         subscribeEv("pty:size:\(sid)") { [weak self] args in

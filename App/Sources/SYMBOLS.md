@@ -15,6 +15,11 @@ symbols below by reading the Kit sources.
 
 ## Models (Sources/NodetermKit/Models)
 
+- `TerminalScrollMotion` (Terminal/) — `begin()`, `drag(points:)`, `end(velocity:)`,
+  `advance(seconds:lineHeight:) -> Int`, `needsFrame(lineHeight:)`, `cancel()`;
+  frame-rate-independent remote wheel momentum, capped at eight lines per frame. Native
+  SwiftTerm history scrolling is used when mouse reporting is off.
+
 - `JSONValue` — cases `.null/.bool/.number/.string/.array/.object`; accessors `.stringValue`,
   `.boolValue`, `.intValue`, `.doubleValue`, `.objectValue`, `.arrayValue`; `subscript(String)`,
   `subscript(Int)`; `.decoded(as:)`; `ExpressibleBy{String,Integer,Float,Boolean,Nil}Literal`.
